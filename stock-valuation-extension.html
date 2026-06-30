@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stock in Hand — Valuation as of Date (Manager.io Extension)</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:#fff; color:#24292f; min-height:100vh; padding:20px; }
+
+  /* Control bar */
+  .ctrl-bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px 16px; margin-bottom:18px; background:#f6f8fa; border:1px solid #d0d7de; border-radius:10px; }
+  .load-btn { padding:8px 20px; border:none; border-radius:7px; cursor:pointer; font-size:13px; font-weight:700; background:#0969da; color:#fff; transition:opacity .15s; }
+  .load-btn:disabled { opacity:.45; cursor:not-allowed; }
+  .prog-wrap { flex:1; min-width:100px; height:5px; background:#d0d7de; border-radius:3px; overflow:hidden; }
+  .prog-bar  { height:100%; width:0%; background:#0969da; border-radius:3px; transition:width .25s; }
+  .status-txt { font-size:12px; color:#57606a; white-space:nowrap; }
+
+  .err-box { color:#cf222e; background:#fff5f5; border:1px solid #ffcfcf; border-radius:8px; padding:12px 16px; font-size:13px; margin-bottom:16px; }
+  .ok-box  { color:#1a7f37; background:#f0fff4; border:1px solid #b6f0c4; border-radius:8px; padding:12px 16px; font-size:13px; margin-bottom:16px; }
+  .warn-box{ color:#9a6700; background:#fffbe6; border:1px solid #f0e2a6; border-radius:8px; padding:12px 16px; font-size:13px; margin-bottom:16px; }
+
+  .card { background:#fff; border:1px solid #d0d7de; border-radius:12px; padding:20px; margin-bottom:18px; }
+  .card h2 { font-size:16px; margin-bottom:4px; }
+  .card .sub { font-size:12px; color:#57606a; margin-bottom:16px; }
+
+  /* Filter bar */
+  .filters { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end; }
+  .field label { display:block; font-size:12px; font-weight:600; color:#57606a; margin-bottom:5px; }
+  .field input, .field select { padding:8px 10px; font-size:13px; border:1px solid #d0d7de; border-radius:7px; background:#fff; color:#24292f; font-family:inherit; }
+  .field input:focus, .field select:focus { outline:none; border-color:#0969da; box-shadow:0 0 0 3px rgba(9,105,218,.12); }
+  .chk { display:flex; align-items:center; gap:6px; font-size:13px; color:#24292f; }
+  .btn-primary { padding:9px 20px; border:none; border-radius:8px; background:#0969da; color:#fff; font-weight:700; font-size:14px; cursor:pointer; }
+  .btn-primary:disabled { opacity:.45; cursor:not-allowed; }
+  .btn-secondary { padding:9px 16px; border:1px solid #d0d7de; border-radius:8px; background:#fff; color:#24292f; font-weight:600; font-size:14px; cursor:pointer; }
+
+  /* Results table */
+  table.stock { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
+  table.stock th { text-align:left; font-size:12px; color:#57606a; padding:9px 10px; border-bottom:2px solid #e6eaef; background:#f6f8fa; }
+  table.stock td { padding:8px 10px; border-bottom:1px solid #f0f2f5; vertical-align:middle; }
+  table.stock tbody tr:hover { background:#fafbfc; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  table.stock tfoot td { font-weight:800; border-top:2px solid #d0d7de; background:#f6f8fa; font-size:13.5px; }
+  .muted { color:#8a929b; }
+  .empty { text-align:center; color:#8a929b; padding:40px 20px; font-size:14px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:700; background:#ddf4ff; color:#0969da; }
+
+  /* Print surface */
+  #print-doc { display:none; }
+  .doc-head { display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:10px; margin-bottom:8px; }
+  .doc-title { font-size:18px; font-weight:800; }
+  .doc-meta { font-size:12px; color:#57606a; }
+
+  @media print {
+    body * { visibility:hidden; }
+    #print-doc, #print-doc * { visibility:visible; }
+    #print-doc { display:block !important; position:absolute; left:0; top:0; width:100%; padding:0; }
+    table.stock th { background:#e9e9e9 !important; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    table.stock, table.stock th, table.stock td { border-color:#000 !important; }
+    table.stock th, table.stock td { border:1px solid #000; }
+    @page { margin:12mm; }
+  }
+</style>
+</head>
+<body>
+
+<div class="ctrl-bar">
+  <button class="load-btn" id="load-btn" onclick="loadAllRecords()">⬇ Load All Records</button>
+  <div class="prog-wrap"><div class="prog-bar" id="prog-bar"></div></div>
+  <span class="status-txt" id="status-txt">Press Load to fetch inventory items &amp; unit-cost history from Manager</span>
+</div>
+
+<div id="app"></div>
+
+<div class="card">
+  <h2>Stock in Hand — Valuation as of a Date</h2>
+  <p class="sub">Closing quantity on hand on the chosen date × the unit cost effective on that date = stock value.</p>
+
+  <div class="filters">
+    <div class="field">
+      <label for="f-category">Item Category</label>
+      <select id="f-category">
+        <option value="ALL">All items</option>
+        <option value="RM">Raw Material (code contains “RM”)</option>
+        <option value="FG">Finished Goods (code contains “FG”)</option>
+        <option value="WIP">WIP (code contains “WIP”)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="f-date">As on date</label>
+      <input type="date" id="f-date">
+    </div>
+    <div class="field">
+      <label for="f-search">Search (optional)</label>
+      <input type="text" id="f-search" placeholder="name or code…">
+    </div>
+    <label class="chk"><input type="checkbox" id="f-hidezero" checked> Hide zero quantity</label>
+    <button class="btn-primary" id="gen-btn" onclick="generateReport()" disabled>Generate report</button>
+    <button class="btn-secondary" id="print-btn" onclick="printReport()" disabled>🖨 Print / Save as PDF</button>
+  </div>
+
+  <div id="report-msg"></div>
+  <div id="report"><div class="empty">Load records, choose a category and date, then Generate.</div></div>
+</div>
+
+<div id="print-doc"></div>
+
+<script>
+/* ══════════════════════════════════
+   postMessage helper — DO NOT MODIFY
+══════════════════════════════════ */
+function postMessageWithResponse(message) {
+  return new Promise((resolve, reject) => {
+    const requestId = crypto.randomUUID();
+    const timer = setTimeout(() => {
+      window.removeEventListener('message', handler);
+      reject(new Error('Timeout — is this running inside Manager.io?'));
+    }, 15000);
+    function handler(event) {
+      if (event.data?.type?.endsWith('-response') && event.data?.requestId === requestId) {
+        clearTimeout(timer);
+        window.removeEventListener('message', handler);
+        resolve(event.data.body);
+      }
+    }
+    window.addEventListener('message', handler);
+    window.parent.postMessage({ ...message, requestId }, '*');
+  });
+}
+
+/* ══════════════════════════════════
+   Paginated batch loaders (≤? per page → follow next_page_token)
+══════════════════════════════════ */
+async function getBatch(basePath, onProgress) {
+  const all = [];
+  let nextToken = null, pageNum = 0, apiTotal = null;
+  do {
+    const path = nextToken
+      ? basePath + (basePath.includes('?') ? '&' : '?') + 'PageSize=99999&next_page_token=' + encodeURIComponent(nextToken)
+      : basePath + (basePath.includes('?') ? '&' : '?') + 'PageSize=99999';
+    const data = await postMessageWithResponse({ type:'api-request', method:'GET', path });
+    const page = Array.isArray(data) ? data : (data.items || data.data || []);
+    all.push(...page);
+    nextToken = data.next_page_token || data.nextPageToken || data._links?.next?.href || null;
+    if (apiTotal === null) apiTotal = data.totalCount ?? data.total ?? data.count ?? data._metadata?.totalCount ?? null;
+    pageNum++;
+    if (onProgress) onProgress(all.length, apiTotal, pageNum);
+    if (pageNum >= 1000) break;
+  } while (nextToken);
+  return all;
+}
+
+/* ══════════════════════════════════
+   Global state + helpers
+══════════════════════════════════ */
+let INVENTORY = [];              // raw inventory-item-batch rows
+let UNIT_COST_HISTORY = {};      // invKey -> [{ dayK, cost, date }] ascending by date
+let COST_MAP = {};               // invKey -> latest known unit cost (fallback)
+let LAST_ROWS = [];              // rows of the last generated report (for printing)
+
+const num = v => (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits:4 });
+const money = v => (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits:2, maximumFractionDigits:2 });
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function fmtDate(d) {
+  if (!d) return '—';
+  const dt = new Date(d);
+  return isNaN(dt) ? esc(d) : dt.toLocaleDateString('en-GB', { year:'numeric', month:'short', day:'numeric' });
+}
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function dayKey(dateIso) {
+  if (!dateIso) return '';
+  const s = String(dateIso);
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0,10) : '';
+}
+/* Read item fields defensively (row may be {key,item} wrapper or flat) */
+function invFields(row) {
+  const it  = row?.item || row || {};
+  const key = row?.key || it?.key || '';
+  const itemCode = it?.itemCode || '';
+  const itemName = it?.itemName || '';
+  const label = it?.nameWithCode || [itemCode, itemName].filter(Boolean).join(' - ') || itemName || itemCode || key || '(unnamed)';
+  const unit = it?.unitName || '';
+  // current qty (live) — only used as a flagged fallback when dated qty is unavailable
+  const liveQty = Number(
+    it?.qtyOnHand ?? it?.qtyOwned ?? it?.quantityOnHand ?? it?.qty ?? it?.balanceQty ?? NaN
+  );
+  return { key, itemCode, itemName, label, unit, liveQty: isFinite(liveQty) ? liveQty : null, inactive: !!it?.inactive };
+}
+
+/* ══════════════════════════════════
+   DATE-BASED UNIT COST (Manager's dated cost layers)
+   Rate on a date = unitCost of the latest Inventory-Unit-Cost record
+   dated on or before that date — the value Manager itself applies.
+══════════════════════════════════ */
+function costAsOf(invKey, dk) {
+  const hist = UNIT_COST_HISTORY[invKey];
+  if (!hist || !hist.length) return null;
+  let chosen = null;
+  for (const h of hist) { if (!h.dayK || h.dayK <= dk) chosen = h; else break; }
+  if (!chosen) chosen = hist[0];
+  return chosen ? chosen.cost : null;
+}
+
+/* ══════════════════════════════════
+   DATE-BASED QUANTITY ON HAND
+   Manager only exposes a CLOSING balance for a past date through a report:
+   POST the date to an inventory-quantity report "-form" endpoint (returns a
+   report key), then GET the matching "-view/{key}". This is a report-generation
+   call (read-oriented) — it does not post any financial transaction.
+   Falls back to live quantity (clearly flagged) if the workflow returns nothing.
+══════════════════════════════════ */
+const QTY_CACHE = {};   // 'YYYY-MM-DD' -> { byKey, byLabel, dated, method }
+const enc = encodeURIComponent;
+const isoMidnight = dk => dk + 'T00:00:00';
+const FAR_PAST = '1900-01-01T00:00:00';
+
+/* Recursively pull {itemId/label -> qty} pairs out of a report-view shape.
+   Closing-balance field names are tried first so the Summary report resolves to
+   the closing quantity (not opening / received / sold). */
+function harvestQty(node, byKey, byLabel) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) { node.forEach(n => harvestQty(n, byKey, byLabel)); return; }
+
+  const qtyRaw = node.closingQty ?? node.closingBalance ?? node.closingQuantity ?? node.closing
+              ?? node.qtyOwned ?? node.quantityOwned ?? node.owned ?? node.onHand
+              ?? node.qtyOnHand ?? node.quantityOnHand ?? node.balanceQty ?? node.balance
+              ?? node.netQuantity ?? node.quantity ?? node.qty ?? null;
+  const qty = (qtyRaw != null && isFinite(Number(qtyRaw))) ? Number(qtyRaw) : null;
+
+  const idKey = node.inventoryItem || node.item || node.inventoryItemKey || node.itemKey || null;
+  const idLabel = node.itemName || node.name || node.description || node.nameWithCode || null;
+
+  if (qty != null && (idKey || idLabel)) {
+    if (idKey)   byKey[idKey] = (byKey[idKey] || 0) + qty;   // sum across locations
+    if (idLabel) { const L = String(idLabel).trim().toLowerCase(); byLabel[L] = (byLabel[L] || 0) + qty; }
+  }
+  for (const k in node) { const v = node[k]; if (v && typeof v === 'object') harvestQty(v, byKey, byLabel); }
+}
+
+function extractKey(created) {
+  return created?.key || created?.id || created?.value?.key || created?.reportKey
+      || (typeof created === 'string' ? created : null);
+}
+
+/* Best-effort removal of the transient report we created (keeps Manager's
+   Reports list clean). Only ever deletes the exact key we just made. */
+async function cleanupReport(base, key) {
+  if (!base.startsWith('/api4/') || !key) return;
+  for (const p of [ base + '?id=' + enc(key), base + '/' + enc(key) ]) {
+    try { await postMessageWithResponse({ type:'api-request', method:'DELETE', path: p }); return; }
+    catch (e) { /* ignore */ }
+  }
+}
+
+/* Create a report (POST), read its computed rows (from the POST response itself
+   or from a -view GET), then clean up. Returns {byKey,byLabel} or null. */
+async function runReport(strategy) {
+  let created;
+  try { created = await postMessageWithResponse({ type:'api-request', method:'POST', path: strategy.create, body: strategy.body }); }
+  catch (e) { return null; }
+
+  // Some builds return the computed rows directly in the POST response.
+  let byKey = {}, byLabel = {};
+  harvestQty(created, byKey, byLabel);
+  const key = extractKey(created);
+  if (Object.keys(byKey).length || Object.keys(byLabel).length) { await cleanupReport(strategy.create, key); return { byKey, byLabel }; }
+
+  if (!key) return null;
+  for (const vb of strategy.views) {
+    try {
+      const view = await postMessageWithResponse({ type:'api-request', method:'GET', path: vb(key) });
+      const k = {}, l = {};
+      harvestQty(view, k, l);
+      if (Object.keys(k).length || Object.keys(l).length) { await cleanupReport(strategy.create, key); return { byKey:k, byLabel:l }; }
+    } catch (e) { /* try next view path */ }
+  }
+  await cleanupReport(strategy.create, key);
+  return null;
+}
+
+async function getQtyAsOf(dateIso) {
+  const dk = dayKey(dateIso) || todayStr();
+  if (QTY_CACHE[dk]) return QTY_CACHE[dk];
+  const asOn = isoMidnight(dk);
+
+  // Strategies in priority order. "By Location" takes a single as-on `date`
+  // (cleanest closing balance); "Summary" uses fromDate→toDate (closing = qty at toDate).
+  const strategies = [
+    { method:'by-location (api4)', create:'/api4/inventory-quantity-by-location',
+      body:{ value:{ date:asOn, customInventoryLocations:false, inventoryLocations:null, customTheme:false, customThemeId:null }, business:null },
+      views:[ k=>`/api4/inventory-quantity-by-location-view/${enc(k)}`, k=>`/api4/inventory-quantity-by-location-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-by-location?id=${enc(k)}` ] },
+    { method:'by-location (api2)', create:'/api2/inventory-quantity-by-location-form',
+      body:{ date:asOn },
+      views:[ k=>`/api2/inventory-quantity-by-location-view/${enc(k)}` ] },
+    { method:'summary (api4)', create:'/api4/inventory-quantity-summary',
+      body:{ value:{ fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false, customTheme:false, customThemeId:null }, business:null },
+      views:[ k=>`/api4/inventory-quantity-summary-view/${enc(k)}`, k=>`/api4/inventory-quantity-summary-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-summary?id=${enc(k)}` ] },
+    { method:'summary (api2)', create:'/api2/inventory-quantity-summary-form',
+      body:{ fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false },
+      views:[ k=>`/api2/inventory-quantity-summary-view/${enc(k)}` ] }
+  ];
+
+  let byKey = {}, byLabel = {}, dated = false, method = '';
+  for (const s of strategies) {
+    const r = await runReport(s);
+    if (r && (Object.keys(r.byKey).length || Object.keys(r.byLabel).length)) {
+      byKey = r.byKey; byLabel = r.byLabel; dated = true; method = s.method;
+      console.log('Stock report: dated quantities via', s.method, '— items:', Object.keys(byKey).length || Object.keys(byLabel).length);
+      break;
+    }
+  }
+
+  // Fallback: live quantity from the inventory items (NOT date-specific)
+  if (!dated) {
+    for (const row of INVENTORY) {
+      const f = invFields(row);
+      if (f.key && f.liveQty != null) byKey[f.key] = f.liveQty;
+    }
+    console.warn('Stock report: no dated quantity available — using live qty fallback.');
+  }
+
+  const result = { byKey, byLabel, dated, method };
+  QTY_CACHE[dk] = result;
+  return result;
+}
+
+/* ══════════════════════════════════
+   Load
+══════════════════════════════════ */
+async function loadAllRecords() {
+  const btn = document.getElementById('load-btn');
+  const bar = document.getElementById('prog-bar');
+  const status = document.getElementById('status-txt');
+  const app = document.getElementById('app');
+
+  btn.disabled = true; btn.textContent = 'Loading…';
+  bar.style.width = '0%'; app.innerHTML = '';
+  QTY_CACHE && Object.keys(QTY_CACHE).forEach(k => delete QTY_CACHE[k]);
+
+  try {
+    // 1) Inventory items
+    status.textContent = 'Loading inventory items…';
+    INVENTORY = await getBatch('/api4/inventory-item-batch', (loaded, total, page) => {
+      status.textContent = total ? `Inventory · ${loaded}/${total}` : `Inventory · ${loaded} loaded…`;
+      if (total) bar.style.width = Math.min(55, Math.round(loaded/total*55)) + '%';
+    });
+
+    // 2) Inventory unit-cost history (dated layers → Rate)
+    UNIT_COST_HISTORY = {}; COST_MAP = {};
+    try {
+      status.textContent = 'Loading inventory unit costs…';
+      const unitCosts = await getBatch('/api4/inventory-unit-cost-batch', (loaded, total, page) => {
+        status.textContent = total ? `Unit costs · ${loaded}/${total}` : `Unit costs · ${loaded} loaded…`;
+        bar.style.width = (60 + Math.min(35, page*4)) + '%';
+      });
+      for (const row of unitCosts) {
+        const c = row?.item || row || {};
+        const invKey = c?.inventoryItem || row?.key;
+        if (!invKey) continue;
+        const cost = Number(c?.unitCost);
+        if (!isFinite(cost)) continue;
+        (UNIT_COST_HISTORY[invKey] = UNIT_COST_HISTORY[invKey] || []).push({ dayK: dayKey(c?.date), cost, date: c?.date || null });
+      }
+      for (const k in UNIT_COST_HISTORY) {
+        const arr = UNIT_COST_HISTORY[k];
+        arr.sort((a,b) => (a.dayK < b.dayK ? -1 : a.dayK > b.dayK ? 1 : 0));
+        COST_MAP[k] = arr[arr.length-1].cost;
+      }
+    } catch (e) { console.warn('Unit cost load failed (Rate will be blank):', e); }
+
+    bar.style.width = '100%';
+    const costN = Object.keys(UNIT_COST_HISTORY).length;
+    status.textContent = `✓ ${INVENTORY.length} inventory items · ${costN} items with cost history`;
+    btn.textContent = '↺ Reload'; btn.disabled = false;
+
+    app.innerHTML = `<div class="ok-box">Loaded ${INVENTORY.length} inventory items and unit-cost history for ${costN} items. Choose a category and date, then Generate.</div>`;
+    if (!document.getElementById('f-date').value) document.getElementById('f-date').value = todayStr();
+    document.getElementById('gen-btn').disabled = false;
+  } catch (err) {
+    status.textContent = '⚠ ' + err.message;
+    btn.textContent = '↺ Retry'; btn.disabled = false;
+    app.innerHTML = `<div class="err-box">⚠ ${esc(err.message)}<br><small>Make sure this is running inside Manager.io</small></div>`;
+  }
+}
+
+/* ══════════════════════════════════
+   Category matching by item-code substring
+══════════════════════════════════ */
+function matchesCategory(itemCode, cat) {
+  if (cat === 'ALL') return true;
+  const code = String(itemCode || '').toUpperCase();
+  return code.includes(cat);   // 'RM' | 'FG' | 'WIP'
+}
+
+/* ══════════════════════════════════
+   Generate report
+══════════════════════════════════ */
+async function generateReport() {
+  const msg = document.getElementById('report-msg');
+  const out = document.getElementById('report');
+  msg.innerHTML = '';
+
+  if (!INVENTORY.length) { msg.innerHTML = `<div class="err-box">Load records first.</div>`; return; }
+
+  const cat = document.getElementById('f-category').value;
+  const dateVal = document.getElementById('f-date').value || todayStr();
+  const dk = dayKey(dateVal);
+  const search = (document.getElementById('f-search').value || '').trim().toLowerCase();
+  const hideZero = document.getElementById('f-hidezero').checked;
+
+  const genBtn = document.getElementById('gen-btn');
+  genBtn.disabled = true; genBtn.textContent = 'Generating…';
+  out.innerHTML = `<div class="empty">Fetching closing quantities as of ${fmtDate(dk)}…</div>`;
+
+  let qtyInfo;
+  try { qtyInfo = await getQtyAsOf(dateVal); }
+  catch (e) { qtyInfo = { byKey:{}, byLabel:{}, dated:false }; }
+
+  // Build rows
+  const rows = [];
+  for (const row of INVENTORY) {
+    const f = invFields(row);
+    if (!f.key) continue;
+    if (!matchesCategory(f.itemCode, cat)) continue;
+    if (search && !(f.label.toLowerCase().includes(search) || (f.itemCode||'').toLowerCase().includes(search))) continue;
+
+    // Qty as of date: by key, else by name/code label, else null
+    let qty = qtyInfo.byKey[f.key];
+    if (qty == null && f.itemName)  qty = qtyInfo.byLabel[f.itemName.trim().toLowerCase()];
+    if (qty == null && f.label)     qty = qtyInfo.byLabel[f.label.trim().toLowerCase()];
+    qty = (qty != null && isFinite(Number(qty))) ? Number(qty) : 0;
+
+    const rate = costAsOf(f.key, dk);
+    const amount = (rate != null) ? qty * rate : null;
+
+    if (hideZero && Math.abs(qty) < 1e-9) continue;
+    rows.push({ label: f.label, unit: f.unit, qty, rate, amount });
+  }
+  rows.sort((a,b) => a.label.localeCompare(b.label, undefined, { numeric:true, sensitivity:'base' }));
+  LAST_ROWS = rows;
+
+  const totalAmount = rows.reduce((t,r) => t + ((r.amount != null && isFinite(r.amount)) ? r.amount : 0), 0);
+  const catLabel = ({ ALL:'All items', RM:'Raw Material', FG:'Finished Goods', WIP:'WIP' })[cat] || cat;
+
+  // Cost-basis / qty-basis notes
+  const qtyNote = qtyInfo.dated
+    ? `Quantities are closing balances as on ${fmtDate(dk)} (Manager ${esc(qtyInfo.method || 'inventory-quantity report')}).`
+    : `Could not retrieve a date-specific closing balance, so quantities shown are the current live quantity on hand — not the balance as on ${fmtDate(dk)}. Rate is still date-correct.`;
+  msg.innerHTML = `<div class="${qtyInfo.dated ? 'ok-box' : 'warn-box'}">${esc(qtyNote)}</div>`;
+
+  if (!rows.length) {
+    out.innerHTML = `<div class="empty">No items match “${esc(catLabel)}”${search ? ' / “'+esc(search)+'”' : ''} on ${esc(fmtDate(dk))}.</div>`;
+  } else {
+    out.innerHTML = renderTable(rows, totalAmount, catLabel, dk);
+  }
+
+  // Build print surface
+  document.getElementById('print-doc').innerHTML = rows.length ? `
+    <div class="doc-head">
+      <div class="doc-title">Stock in Hand — ${esc(catLabel)}</div>
+      <div class="doc-meta">As on ${esc(fmtDate(dk))}</div>
+    </div>
+    ${renderTable(rows, totalAmount, catLabel, dk)}` : '';
+  document.getElementById('print-btn').disabled = !rows.length;
+
+  genBtn.disabled = false; genBtn.textContent = 'Generate report';
+}
+
+function renderTable(rows, totalAmount, catLabel, dk) {
+  const body = rows.map((r, i) => `
+    <tr>
+      <td>${i+1}</td>
+      <td>${esc(r.label)}${r.unit ? ` <span class="muted">(${esc(r.unit)})</span>` : ''}</td>
+      <td class="num">${num(r.qty)}</td>
+      <td class="num">${r.rate != null ? money(r.rate) : '<span class="muted">—</span>'}</td>
+      <td class="num">${r.amount != null ? money(r.amount) : '<span class="muted">—</span>'}</td>
+    </tr>`).join('');
+  return `
+    <table class="stock">
+      <thead>
+        <tr>
+          <th style="width:42px">#</th>
+          <th>Inventory Item</th>
+          <th class="num" style="width:130px">Qty in Hand</th>
+          <th class="num" style="width:130px">Rate</th>
+          <th class="num" style="width:150px">Amount</th>
+        </tr>
+      </thead>
+      <tbody>${body}</tbody>
+      <tfoot>
+        <tr>
+          <td colspan="4" class="num">Total Stock Value — ${esc(catLabel)} as on ${esc(fmtDate(dk))}</td>
+          <td class="num">${money(totalAmount)}</td>
+        </tr>
+      </tfoot>
+    </table>`;
+}
+
+function printReport() { window.print(); }
+
+/* Initialise */
+document.getElementById('f-date').value = todayStr();
+</script>
+</body>
+</html>
