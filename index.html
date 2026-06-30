@@ -504,13 +504,21 @@ async function generateReport() {
   const gotAnyQty = Object.values(qtyInfo.byKey || {}).some(v => Math.abs(Number(v)||0) > 1e-9)
                  || Object.values(qtyInfo.byLabel || {}).some(v => Math.abs(Number(v)||0) > 1e-9);
 
-  // Diagnostics panel (shown whenever the dated fetch didn't succeed) so the raw
+  // Diagnostics (shown whenever the dated fetch didn't succeed) so the raw
   // responses can be copied back to refine the exact endpoint/field.
-  const diagHtml = (!qtyInfo.dated && qtyInfo.log && qtyInfo.log.length)
-    ? `<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;color:#57606a">Show technical details (copy &amp; send these)</summary>
-        <pre style="white-space:pre-wrap;font-size:11px;background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:10px;margin-top:8px;max-height:340px;overflow:auto">${
-          esc(qtyInfo.log.map(e => `${e.ok ? '✓' : '✗'} ${e.step}\n   ${e.preview}`).join('\n\n'))
-        }</pre></details>`
+  const diagText = (qtyInfo.log && qtyInfo.log.length)
+    ? qtyInfo.log.map(e => `${e.ok ? 'OK ' : 'ERR'} ${e.step}\n   ${e.preview}`).join('\n\n')
+    : '(no diagnostic entries were captured — the API bridge may have rejected the requests silently)';
+  window.__DIAG = diagText;
+  const diagHtml = (!qtyInfo.dated)
+    ? `<div style="margin-top:12px;border:1px solid #d0d7de;border-radius:10px;padding:12px;background:#fbfcfd">
+         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+           <strong style="font-size:13px">Technical details — please copy &amp; send these</strong>
+           <button class="btn-secondary" style="padding:5px 12px;font-size:12px"
+                   onclick="navigator.clipboard.writeText(window.__DIAG).then(()=>this.textContent='Copied ✓').catch(()=>{const t=document.getElementById('diag-text');t.focus();t.select();})">Copy diagnostics</button>
+         </div>
+         <textarea id="diag-text" readonly style="width:100%;height:240px;margin-top:8px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid #d0d7de;border-radius:8px;padding:10px;white-space:pre;overflow:auto">${esc(diagText)}</textarea>
+       </div>`
     : '';
 
   let noteCls, noteTxt;
