@@ -240,6 +240,50 @@ function harvestQty(node, byKey, byLabel) {
   for (const k in node) { const v = node[k]; if (v && typeof v === 'object') harvestQty(v, byKey, byLabel); }
 }
 
+/* Manager report "-view" responses are often an HTML page, not JSON. Parse the
+   table(s): take the first text cell as the item label and the last numeric cell
+   as the quantity. Keyed by label (matched to items by name/code at render time). */
+function harvestHtml(html, byKey, byLabel) {
+  let doc;
+  try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (e) { return; }
+  doc.querySelectorAll('table tr').forEach(tr => {
+    const cells = Array.from(tr.children).map(td => (td.textContent || '').trim());
+    if (cells.length < 2) return;
+    const name = cells[0];
+    if (!name || /^(total|grand total|inventory item|item)/i.test(name)) return;  // skip headers/totals
+    let qty = null;
+    for (let i = cells.length - 1; i >= 1; i--) {
+      if (cells[i] === '') continue;
+      const n = Number(cells[i].replace(/,/g, ''));
+      if (isFinite(n)) { qty = n; break; }
+    }
+    if (qty == null) return;
+    const L = name.toLowerCase();
+    byLabel[L] = (byLabel[L] || 0) + qty;
+  });
+}
+
+/* Route a response (object, JSON string, or HTML string) into the qty maps. */
+function ingest(resp, byKey, byLabel) {
+  if (resp == null) return;
+  if (typeof resp === 'string') {
+    const s = resp.trim();
+    if (s[0] === '{' || s[0] === '[') { try { harvestQty(JSON.parse(s), byKey, byLabel); return; } catch (e) {} }
+    harvestHtml(s, byKey, byLabel);
+    return;
+  }
+  harvestQty(resp, byKey, byLabel);
+}
+
+/* Compact, escaped preview of any response for the on-screen diagnostics panel. */
+function preview(resp) {
+  let s;
+  try { s = (typeof resp === 'string') ? resp : JSON.stringify(resp); }
+  catch (e) { s = String(resp); }
+  s = (s == null) ? 'null' : String(s);
+  return s.length > 900 ? s.slice(0, 900) + ' …[truncated]' : s;
+}
+
 function extractKey(created) {
   return created?.key || created?.id || created?.value?.key || created?.reportKey
       || (typeof created === 'string' ? created : null);
@@ -256,29 +300,41 @@ async function cleanupReport(base, key) {
 }
 
 /* Create a report (POST), read its computed rows (from the POST response itself
-   or from a -view GET), then clean up. Returns {byKey,byLabel} or null. */
+   or from a -view GET), then clean up. Returns { result:{byKey,byLabel}|null, log:[] }. */
 async function runReport(strategy) {
+  const log = [];
   let created;
-  try { created = await postMessageWithResponse({ type:'api-request', method:'POST', path: strategy.create, body: strategy.body }); }
-  catch (e) { return null; }
+  try {
+    created = await postMessageWithResponse({ type:'api-request', method:'POST', path: strategy.create, body: strategy.body });
+    log.push({ step:'POST ' + strategy.create, ok:true, preview: preview(created) });
+  } catch (e) {
+    log.push({ step:'POST ' + strategy.create, ok:false, preview: e.message });
+    return { result:null, log };
+  }
 
   // Some builds return the computed rows directly in the POST response.
   let byKey = {}, byLabel = {};
-  harvestQty(created, byKey, byLabel);
+  ingest(created, byKey, byLabel);
   const key = extractKey(created);
-  if (Object.keys(byKey).length || Object.keys(byLabel).length) { await cleanupReport(strategy.create, key); return { byKey, byLabel }; }
+  if (Object.keys(byKey).length || Object.keys(byLabel).length) { await cleanupReport(strategy.create, key); return { result:{ byKey, byLabel }, log }; }
 
-  if (!key) return null;
+  if (!key) { log.push({ step:'extractKey', ok:false, preview:'no report key found in POST response' }); return { result:null, log }; }
+
   for (const vb of strategy.views) {
+    const path = vb(key);
     try {
-      const view = await postMessageWithResponse({ type:'api-request', method:'GET', path: vb(key) });
+      const view = await postMessageWithResponse({ type:'api-request', method:'GET', path });
       const k = {}, l = {};
-      harvestQty(view, k, l);
-      if (Object.keys(k).length || Object.keys(l).length) { await cleanupReport(strategy.create, key); return { byKey:k, byLabel:l }; }
-    } catch (e) { /* try next view path */ }
+      ingest(view, k, l);
+      const n = Object.keys(k).length || Object.keys(l).length;
+      log.push({ step:'GET ' + path, ok:true, preview:`rows:${n} · ` + preview(view) });
+      if (n) { await cleanupReport(strategy.create, key); return { result:{ byKey:k, byLabel:l }, log }; }
+    } catch (e) {
+      log.push({ step:'GET ' + path, ok:false, preview: e.message });
+    }
   }
   await cleanupReport(strategy.create, key);
-  return null;
+  return { result:null, log };
 }
 
 async function getQtyAsOf(dateIso) {
@@ -286,29 +342,29 @@ async function getQtyAsOf(dateIso) {
   if (QTY_CACHE[dk]) return QTY_CACHE[dk];
   const asOn = isoMidnight(dk);
 
-  // Strategies in priority order. "By Location" takes a single as-on `date`
-  // (cleanest closing balance); "Summary" uses fromDate→toDate (closing = qty at toDate).
+  // Strategies in priority order. Summary first (confirmed to render in the UI):
+  // fromDate→toDate, where closing balance = quantity at toDate. By-location is a fallback.
   const strategies = [
+    { method:'summary (api4)', create:'/api4/inventory-quantity-summary',
+      body:{ value:{ description:null, fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false, customTheme:false, customThemeId:null }, business:null },
+      views:[ k=>`/api4/inventory-quantity-summary-view/${enc(k)}`, k=>`/api4/inventory-quantity-summary-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-summary?id=${enc(k)}`, k=>`/api4/inventory-quantity-summary/${enc(k)}` ] },
+    { method:'summary (api2)', create:'/api2/inventory-quantity-summary-form',
+      body:{ fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false },
+      views:[ k=>`/api2/inventory-quantity-summary-view/${enc(k)}` ] },
     { method:'by-location (api4)', create:'/api4/inventory-quantity-by-location',
       body:{ value:{ date:asOn, customInventoryLocations:false, inventoryLocations:null, customTheme:false, customThemeId:null }, business:null },
       views:[ k=>`/api4/inventory-quantity-by-location-view/${enc(k)}`, k=>`/api4/inventory-quantity-by-location-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-by-location?id=${enc(k)}` ] },
     { method:'by-location (api2)', create:'/api2/inventory-quantity-by-location-form',
       body:{ date:asOn },
-      views:[ k=>`/api2/inventory-quantity-by-location-view/${enc(k)}` ] },
-    { method:'summary (api4)', create:'/api4/inventory-quantity-summary',
-      body:{ value:{ fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false, customTheme:false, customThemeId:null }, business:null },
-      views:[ k=>`/api4/inventory-quantity-summary-view/${enc(k)}`, k=>`/api4/inventory-quantity-summary-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-summary?id=${enc(k)}` ] },
-    { method:'summary (api2)', create:'/api2/inventory-quantity-summary-form',
-      body:{ fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false },
-      views:[ k=>`/api2/inventory-quantity-summary-view/${enc(k)}` ] }
+      views:[ k=>`/api2/inventory-quantity-by-location-view/${enc(k)}` ] }
   ];
 
-  let byKey = {}, byLabel = {}, dated = false, method = '';
+  let byKey = {}, byLabel = {}, dated = false, method = '', log = [];
   for (const s of strategies) {
-    const r = await runReport(s);
-    if (r && (Object.keys(r.byKey).length || Object.keys(r.byLabel).length)) {
-      byKey = r.byKey; byLabel = r.byLabel; dated = true; method = s.method;
-      console.log('Stock report: dated quantities via', s.method, '— items:', Object.keys(byKey).length || Object.keys(byLabel).length);
+    const { result, log: rlog } = await runReport(s);
+    log = log.concat(rlog);
+    if (result && (Object.keys(result.byKey).length || Object.keys(result.byLabel).length)) {
+      byKey = result.byKey; byLabel = result.byLabel; dated = true; method = s.method;
       break;
     }
   }
@@ -319,12 +375,11 @@ async function getQtyAsOf(dateIso) {
       const f = invFields(row);
       if (f.key && f.liveQty != null) byKey[f.key] = f.liveQty;
     }
-    console.warn('Stock report: no dated quantity available — using live qty fallback.');
   }
 
-  const result = { byKey, byLabel, dated, method };
-  QTY_CACHE[dk] = result;
-  return result;
+  const out = { byKey, byLabel, dated, method, log };
+  QTY_CACHE[dk] = out;
+  return out;
 }
 
 /* ══════════════════════════════════
@@ -445,14 +500,34 @@ async function generateReport() {
   const totalAmount = rows.reduce((t,r) => t + ((r.amount != null && isFinite(r.amount)) ? r.amount : 0), 0);
   const catLabel = ({ ALL:'All items', RM:'Raw Material', FG:'Finished Goods', WIP:'WIP' })[cat] || cat;
 
-  // Cost-basis / qty-basis notes
-  const qtyNote = qtyInfo.dated
-    ? `Quantities are closing balances as on ${fmtDate(dk)} (Manager ${esc(qtyInfo.method || 'inventory-quantity report')}).`
-    : `Could not retrieve a date-specific closing balance, so quantities shown are the current live quantity on hand — not the balance as on ${fmtDate(dk)}. Rate is still date-correct.`;
-  msg.innerHTML = `<div class="${qtyInfo.dated ? 'ok-box' : 'warn-box'}">${esc(qtyNote)}</div>`;
+  // How many items got a non-zero quantity from whatever source
+  const gotAnyQty = Object.values(qtyInfo.byKey || {}).some(v => Math.abs(Number(v)||0) > 1e-9)
+                 || Object.values(qtyInfo.byLabel || {}).some(v => Math.abs(Number(v)||0) > 1e-9);
+
+  // Diagnostics panel (shown whenever the dated fetch didn't succeed) so the raw
+  // responses can be copied back to refine the exact endpoint/field.
+  const diagHtml = (!qtyInfo.dated && qtyInfo.log && qtyInfo.log.length)
+    ? `<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;color:#57606a">Show technical details (copy &amp; send these)</summary>
+        <pre style="white-space:pre-wrap;font-size:11px;background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:10px;margin-top:8px;max-height:340px;overflow:auto">${
+          esc(qtyInfo.log.map(e => `${e.ok ? '✓' : '✗'} ${e.step}\n   ${e.preview}`).join('\n\n'))
+        }</pre></details>`
+    : '';
+
+  let noteCls, noteTxt;
+  if (qtyInfo.dated) {
+    noteCls = 'ok-box';
+    noteTxt = `Quantities are closing balances as on ${fmtDate(dk)} (Manager ${qtyInfo.method || 'inventory-quantity report'}).`;
+  } else if (gotAnyQty) {
+    noteCls = 'warn-box';
+    noteTxt = `Could not retrieve a date-specific closing balance, so quantities shown are the current live quantity on hand — not the balance as on ${fmtDate(dk)}. Rate is still date-correct.`;
+  } else {
+    noteCls = 'err-box';
+    noteTxt = `Couldn't obtain quantities. Manager's item list doesn't expose quantity, and the dated inventory-quantity report returned no rows on this build. Rate is correct; quantity needs the report endpoint to work.`;
+  }
+  msg.innerHTML = `<div class="${noteCls}">${esc(noteTxt)}</div>${diagHtml}`;
 
   if (!rows.length) {
-    out.innerHTML = `<div class="empty">No items match “${esc(catLabel)}”${search ? ' / “'+esc(search)+'”' : ''} on ${esc(fmtDate(dk))}.</div>`;
+    out.innerHTML = `<div class="empty">No items to show for “${esc(catLabel)}”${search ? ' / “'+esc(search)+'”' : ''} on ${esc(fmtDate(dk))}${hideZero ? ' (zero-quantity rows are hidden).' : '.'}</div>`;
   } else {
     out.innerHTML = renderTable(rows, totalAmount, catLabel, dk);
   }
