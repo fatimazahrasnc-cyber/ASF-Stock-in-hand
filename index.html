@@ -95,6 +95,8 @@
       <input type="text" id="f-search" placeholder="name or code…">
     </div>
     <label class="chk"><input type="checkbox" id="f-hidezero" checked> Hide zero quantity</label>
+    <label class="chk"><input type="checkbox" id="f-prod"> Include production</label>
+    <label class="chk"><input type="checkbox" id="f-break"> Show breakdown</label>
     <button class="btn-primary" id="gen-btn" onclick="generateReport()" disabled>Generate report</button>
     <button class="btn-secondary" id="print-btn" onclick="printReport()" disabled>🖨 Print / Save as PDF</button>
   </div>
@@ -205,181 +207,70 @@ function costAsOf(invKey, dk) {
 }
 
 /* ══════════════════════════════════
-   DATE-BASED QUANTITY ON HAND
-   Manager only exposes a CLOSING balance for a past date through a report:
-   POST the date to an inventory-quantity report "-form" endpoint (returns a
-   report key), then GET the matching "-view/{key}". This is a report-generation
-   call (read-oriented) — it does not post any financial transaction.
-   Falls back to live quantity (clearly flagged) if the workflow returns nothing.
+   DATE-BASED QUANTITY ON HAND — computed from transactions
+   Manager exposes no per-item dated balance through the in-app bridge, so we
+   reconstruct it the way the ledger does, from the transaction -batch feeds:
+
+     Qty on hand (as of D) =
+        + Inventory item starting balances
+        + Goods receipts            (qty in)
+        + Production produced        (finished item qty)
+        - Production consumed        (bill-of-materials qty)
+        - Delivery notes             (qty out)
+        +/- Journal entries          (signed by debit/credit on inventory lines)
+
+   Everything with a transaction date <= D is included. Inventory transfers net
+   to zero across locations, so they are ignored for total on-hand. Purchase and
+   sales invoices are ignored because this business uses goods receipts and
+   delivery notes for the actual stock movement.
 ══════════════════════════════════ */
-const QTY_CACHE = {};   // 'YYYY-MM-DD' -> { byKey, byLabel, dated, method }
 const enc = encodeURIComponent;
-const isoMidnight = dk => dk + 'T00:00:00';
-const FAR_PAST = '1900-01-01T00:00:00';
 
-/* Recursively pull {itemId/label -> qty} pairs out of a report-view shape.
-   Closing-balance field names are tried first so the Summary report resolves to
-   the closing quantity (not opening / received / sold). */
-function harvestQty(node, byKey, byLabel) {
-  if (!node || typeof node !== 'object') return;
-  if (Array.isArray(node)) { node.forEach(n => harvestQty(n, byKey, byLabel)); return; }
+// Raw transaction stores (filled at load; each entry pre-normalised)
+let TX = { start: [], recv: [], deliv: [], je: [], prod: [] };
 
-  const qtyRaw = node.closingQty ?? node.closingBalance ?? node.closingQuantity ?? node.closing
-              ?? node.qtyOwned ?? node.quantityOwned ?? node.owned ?? node.onHand
-              ?? node.qtyOnHand ?? node.quantityOnHand ?? node.balanceQty ?? node.balance
-              ?? node.netQuantity ?? node.quantity ?? node.qty ?? null;
-  const qty = (qtyRaw != null && isFinite(Number(qtyRaw))) ? Number(qtyRaw) : null;
+function n(v) { const x = Number(v); return isFinite(x) ? x : 0; }
 
-  const idKey = node.inventoryItem || node.item || node.inventoryItemKey || node.itemKey || null;
-  const idLabel = node.itemName || node.name || node.description || node.nameWithCode || null;
-
-  if (qty != null && (idKey || idLabel)) {
-    if (idKey)   byKey[idKey] = (byKey[idKey] || 0) + qty;   // sum across locations
-    if (idLabel) { const L = String(idLabel).trim().toLowerCase(); byLabel[L] = (byLabel[L] || 0) + qty; }
-  }
-  for (const k in node) { const v = node[k]; if (v && typeof v === 'object') harvestQty(v, byKey, byLabel); }
+/* Signed inventory-quantity effect of a journal-entry line.
+   Debit to Inventory on hand increases qty; credit decreases it. */
+function jeLineDelta(l) {
+  const q = n(l?.qty);
+  if (!q) return 0;
+  const d = n(l?.debit), c = n(l?.credit);
+  if (d > 0 && c === 0) return +q;
+  if (c > 0 && d === 0) return -q;
+  return +q;   // fallback: treat as increase
 }
 
-/* Manager report "-view" responses are often an HTML page, not JSON. Parse the
-   table(s): take the first text cell as the item label and the last numeric cell
-   as the quantity. Keyed by label (matched to items by name/code at render time). */
-function harvestHtml(html, byKey, byLabel) {
-  let doc;
-  try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (e) { return; }
-  doc.querySelectorAll('table tr').forEach(tr => {
-    const cells = Array.from(tr.children).map(td => (td.textContent || '').trim());
-    if (cells.length < 2) return;
-    const name = cells[0];
-    if (!name || /^(total|grand total|inventory item|item)/i.test(name)) return;  // skip headers/totals
-    let qty = null;
-    for (let i = cells.length - 1; i >= 1; i--) {
-      if (cells[i] === '') continue;
-      const n = Number(cells[i].replace(/,/g, ''));
-      if (isFinite(n)) { qty = n; break; }
-    }
-    if (qty == null) return;
-    const L = name.toLowerCase();
-    byLabel[L] = (byLabel[L] || 0) + qty;
-  });
-}
+/* Compute qty-on-hand for every item as of day dk, plus a per-item breakdown.
+   Returns { byKey, comp } where comp[key] = {open,recv,prod,cons,deliv,je}. */
+function computeQtyAsOf(dk, includeProduction) {
+  const byKey = {};
+  const comp = {};
+  const C = k => (comp[k] = comp[k] || { open:0, recv:0, prod:0, cons:0, deliv:0, je:0 });
+  const add = (k, q) => { if (k) byKey[k] = (byKey[k] || 0) + q; };
 
-/* Route a response (object, JSON string, or HTML string) into the qty maps. */
-function ingest(resp, byKey, byLabel) {
-  if (resp == null) return;
-  if (typeof resp === 'string') {
-    const s = resp.trim();
-    if (s[0] === '{' || s[0] === '[') { try { harvestQty(JSON.parse(s), byKey, byLabel); return; } catch (e) {} }
-    harvestHtml(s, byKey, byLabel);
-    return;
-  }
-  harvestQty(resp, byKey, byLabel);
-}
+  // Starting balances (opening — always in effect)
+  for (const e of TX.start) { add(e.item, e.qty); C(e.item).open += e.qty; }
 
-/* Compact, escaped preview of any response for the on-screen diagnostics panel. */
-function preview(resp) {
-  let s;
-  try { s = (typeof resp === 'string') ? resp : JSON.stringify(resp); }
-  catch (e) { s = String(resp); }
-  s = (s == null) ? 'null' : String(s);
-  return s.length > 900 ? s.slice(0, 900) + ' …[truncated]' : s;
-}
+  // Goods receipts (+)
+  for (const e of TX.recv) if (!e.day || e.day <= dk) { add(e.item, e.qty); C(e.item).recv += e.qty; }
 
-function extractKey(created) {
-  return created?.key || created?.id || created?.value?.key || created?.reportKey
-      || (typeof created === 'string' ? created : null);
-}
+  // Delivery notes (-)
+  for (const e of TX.deliv) if (!e.day || e.day <= dk) { add(e.item, -e.qty); C(e.item).deliv += e.qty; }
 
-/* Best-effort removal of the transient report we created (keeps Manager's
-   Reports list clean). Only ever deletes the exact key we just made. */
-async function cleanupReport(base, key) {
-  if (!base.startsWith('/api4/') || !key) return;
-  for (const p of [ base + '?id=' + enc(key), base + '/' + enc(key) ]) {
-    try { await postMessageWithResponse({ type:'api-request', method:'DELETE', path: p }); return; }
-    catch (e) { /* ignore */ }
-  }
-}
+  // Journal entries (signed)
+  for (const e of TX.je) if (!e.day || e.day <= dk) { add(e.item, e.qty); C(e.item).je += e.qty; }
 
-/* Create a report (POST), read its computed rows (from the POST response itself
-   or from a -view GET), then clean up. Returns { result:{byKey,byLabel}|null, log:[] }. */
-async function runReport(strategy) {
-  const log = [];
-  let created;
-  try {
-    created = await postMessageWithResponse({ type:'api-request', method:'POST', path: strategy.create, body: strategy.body });
-    log.push({ step:'POST ' + strategy.create, ok:true, preview: preview(created) });
-  } catch (e) {
-    log.push({ step:'POST ' + strategy.create, ok:false, preview: e.message });
-    return { result:null, log };
-  }
-
-  // Some builds return the computed rows directly in the POST response.
-  let byKey = {}, byLabel = {};
-  ingest(created, byKey, byLabel);
-  const key = extractKey(created);
-  if (Object.keys(byKey).length || Object.keys(byLabel).length) { await cleanupReport(strategy.create, key); return { result:{ byKey, byLabel }, log }; }
-
-  if (!key) { log.push({ step:'extractKey', ok:false, preview:'no report key found in POST response' }); return { result:null, log }; }
-
-  for (const vb of strategy.views) {
-    const path = vb(key);
-    try {
-      const view = await postMessageWithResponse({ type:'api-request', method:'GET', path });
-      const k = {}, l = {};
-      ingest(view, k, l);
-      const n = Object.keys(k).length || Object.keys(l).length;
-      log.push({ step:'GET ' + path, ok:true, preview:`rows:${n} · ` + preview(view) });
-      if (n) { await cleanupReport(strategy.create, key); return { result:{ byKey:k, byLabel:l }, log }; }
-    } catch (e) {
-      log.push({ step:'GET ' + path, ok:false, preview: e.message });
-    }
-  }
-  await cleanupReport(strategy.create, key);
-  return { result:null, log };
-}
-
-async function getQtyAsOf(dateIso) {
-  const dk = dayKey(dateIso) || todayStr();
-  if (QTY_CACHE[dk]) return QTY_CACHE[dk];
-  const asOn = isoMidnight(dk);
-
-  // Strategies in priority order. Summary first (confirmed to render in the UI):
-  // fromDate→toDate, where closing balance = quantity at toDate. By-location is a fallback.
-  const strategies = [
-    { method:'summary (api4)', create:'/api4/inventory-quantity-summary',
-      body:{ value:{ description:null, fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false, customTheme:false, customThemeId:null }, business:null },
-      views:[ k=>`/api4/inventory-quantity-summary-view/${enc(k)}`, k=>`/api4/inventory-quantity-summary-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-summary?id=${enc(k)}`, k=>`/api4/inventory-quantity-summary/${enc(k)}` ] },
-    { method:'summary (api2)', create:'/api2/inventory-quantity-summary-form',
-      body:{ fromDate:FAR_PAST, toDate:asOn, excludeItemsWithNoMovement:false },
-      views:[ k=>`/api2/inventory-quantity-summary-view/${enc(k)}` ] },
-    { method:'by-location (api4)', create:'/api4/inventory-quantity-by-location',
-      body:{ value:{ date:asOn, customInventoryLocations:false, inventoryLocations:null, customTheme:false, customThemeId:null }, business:null },
-      views:[ k=>`/api4/inventory-quantity-by-location-view/${enc(k)}`, k=>`/api4/inventory-quantity-by-location-view?id=${enc(k)}`, k=>`/api4/inventory-quantity-by-location?id=${enc(k)}` ] },
-    { method:'by-location (api2)', create:'/api2/inventory-quantity-by-location-form',
-      body:{ date:asOn },
-      views:[ k=>`/api2/inventory-quantity-by-location-view/${enc(k)}` ] }
-  ];
-
-  let byKey = {}, byLabel = {}, dated = false, method = '', log = [];
-  for (const s of strategies) {
-    const { result, log: rlog } = await runReport(s);
-    log = log.concat(rlog);
-    if (result && (Object.keys(result.byKey).length || Object.keys(result.byLabel).length)) {
-      byKey = result.byKey; byLabel = result.byLabel; dated = true; method = s.method;
-      break;
+  // Production orders: produce finished (+), consume materials (-)
+  if (includeProduction) {
+    for (const p of TX.prod) if (!p.day || p.day <= dk) {
+      if (p.producedItem) { add(p.producedItem, p.producedQty); C(p.producedItem).prod += p.producedQty; }
+      for (const m of p.consumed) { add(m.item, -m.qty); C(m.item).cons += m.qty; }
     }
   }
 
-  // Fallback: live quantity from the inventory items (NOT date-specific)
-  if (!dated) {
-    for (const row of INVENTORY) {
-      const f = invFields(row);
-      if (f.key && f.liveQty != null) byKey[f.key] = f.liveQty;
-    }
-  }
-
-  const out = { byKey, byLabel, dated, method, log };
-  QTY_CACHE[dk] = out;
-  return out;
+  return { byKey, comp };
 }
 
 /* ══════════════════════════════════
@@ -393,7 +284,6 @@ async function loadAllRecords() {
 
   btn.disabled = true; btn.textContent = 'Loading…';
   bar.style.width = '0%'; app.innerHTML = '';
-  QTY_CACHE && Object.keys(QTY_CACHE).forEach(k => delete QTY_CACHE[k]);
 
   try {
     // 1) Inventory items
@@ -426,12 +316,71 @@ async function loadAllRecords() {
       }
     } catch (e) { console.warn('Unit cost load failed (Rate will be blank):', e); }
 
+    // 3) Transaction feeds for the quantity engine (best-effort per feed).
+    TX = { start: [], recv: [], deliv: [], je: [], prod: [] };
+    const loadedFeeds = [];
+
+    // Helper: load a batch, tolerate a missing endpoint.
+    async function feed(path, label, onRow) {
+      try {
+        status.textContent = 'Loading ' + label + '…';
+        const rows = await getBatch(path, (loaded) => { status.textContent = `${label} · ${loaded} loaded…`; });
+        let count = 0;
+        for (const row of rows) { const it = row?.item || row || {}; count += (onRow(it) || 0); }
+        loadedFeeds.push(`${label}: ${rows.length}`);
+      } catch (e) { console.warn(label + ' feed unavailable:', e?.message); }
+    }
+
+    // Starting balances (opening qty)
+    await feed('/api4/inventory-item-starting-balance-batch', 'starting balances', it => {
+      const item = it?.inventoryItem;
+      const qty = Array.isArray(it?.qtyOnHandLines) ? it.qtyOnHandLines.reduce((t,l)=>t + n(l?.qtyOnHand), 0) : n(it?.qtyOwned);
+      if (item && qty) { TX.start.push({ item, qty }); return 1; }
+    });
+    bar.style.width = '70%';
+
+    // Goods receipts (+)
+    await feed('/api4/goods-receipt-batch', 'goods receipts', it => {
+      const day = dayKey(it?.date); let c = 0;
+      for (const l of (it?.lines || [])) { const item = l?.item; const q = n(l?.qty); if (item && q) { TX.recv.push({ item, qty:q, day }); c++; } }
+      return c;
+    });
+    bar.style.width = '78%';
+
+    // Delivery notes (-)
+    await feed('/api4/delivery-note-batch', 'delivery notes', it => {
+      const day = dayKey(it?.deliveryDate || it?.date); let c = 0;
+      for (const l of (it?.lines || [])) { const item = l?.item; const q = n(l?.qty); if (item && q) { TX.deliv.push({ item, qty:q, day }); c++; } }
+      return c;
+    });
+    bar.style.width = '85%';
+
+    // Journal entries (signed inventory effect)
+    await feed('/api4/journal-entry-batch', 'journal entries', it => {
+      const day = dayKey(it?.date); let c = 0;
+      for (const l of (it?.lines || [])) { const item = l?.item; const d = jeLineDelta(l); if (item && d) { TX.je.push({ item, qty:d, day }); c++; } }
+      return c;
+    });
+    bar.style.width = '92%';
+
+    // Production orders (+ finished, - consumed)
+    await feed('/api4/production-order-batch', 'production orders', it => {
+      const day = dayKey(it?.date);
+      const producedItem = it?.finishedInventoryItem || null;
+      const producedQty = n(it?.qty);
+      const consumed = Array.isArray(it?.billOfMaterials)
+        ? it.billOfMaterials.map(b => ({ item: b?.billOfMaterials, qty: n(b?.qty) })).filter(m => m.item && m.qty)
+        : [];
+      if (producedItem || consumed.length) { TX.prod.push({ producedItem, producedQty, consumed, day }); return 1; }
+    });
+
     bar.style.width = '100%';
     const costN = Object.keys(UNIT_COST_HISTORY).length;
-    status.textContent = `✓ ${INVENTORY.length} inventory items · ${costN} items with cost history`;
+    status.textContent = `✓ ${INVENTORY.length} items · ${costN} with cost history · ${loadedFeeds.length} transaction feeds`;
     btn.textContent = '↺ Reload'; btn.disabled = false;
 
-    app.innerHTML = `<div class="ok-box">Loaded ${INVENTORY.length} inventory items and unit-cost history for ${costN} items. Choose a category and date, then Generate.</div>`;
+    const feedNote = loadedFeeds.length ? `<br><small>Feeds — ${esc(loadedFeeds.join(' · '))}</small>` : `<br><small class="muted">No transaction feeds loaded — quantities will be zero. The endpoint names may differ on your build.</small>`;
+    app.innerHTML = `<div class="ok-box">Loaded ${INVENTORY.length} inventory items and unit-cost history for ${costN} items.${feedNote}</div>`;
     if (!document.getElementById('f-date').value) document.getElementById('f-date').value = todayStr();
     document.getElementById('gen-btn').disabled = false;
   } catch (err) {
@@ -467,12 +416,11 @@ async function generateReport() {
   const hideZero = document.getElementById('f-hidezero').checked;
 
   const genBtn = document.getElementById('gen-btn');
+  const includeProd = document.getElementById('f-prod').checked;
+  const showBreak = document.getElementById('f-break').checked;
   genBtn.disabled = true; genBtn.textContent = 'Generating…';
-  out.innerHTML = `<div class="empty">Fetching closing quantities as of ${fmtDate(dk)}…</div>`;
 
-  let qtyInfo;
-  try { qtyInfo = await getQtyAsOf(dateVal); }
-  catch (e) { qtyInfo = { byKey:{}, byLabel:{}, dated:false }; }
+  const { byKey, comp } = computeQtyAsOf(dk, includeProd);
 
   // Build rows
   const rows = [];
@@ -482,17 +430,12 @@ async function generateReport() {
     if (!matchesCategory(f.itemCode, cat)) continue;
     if (search && !(f.label.toLowerCase().includes(search) || (f.itemCode||'').toLowerCase().includes(search))) continue;
 
-    // Qty as of date: by key, else by name/code label, else null
-    let qty = qtyInfo.byKey[f.key];
-    if (qty == null && f.itemName)  qty = qtyInfo.byLabel[f.itemName.trim().toLowerCase()];
-    if (qty == null && f.label)     qty = qtyInfo.byLabel[f.label.trim().toLowerCase()];
-    qty = (qty != null && isFinite(Number(qty))) ? Number(qty) : 0;
-
+    const qty = n(byKey[f.key]);
     const rate = costAsOf(f.key, dk);
     const amount = (rate != null) ? qty * rate : null;
 
     if (hideZero && Math.abs(qty) < 1e-9) continue;
-    rows.push({ label: f.label, unit: f.unit, qty, rate, amount });
+    rows.push({ label: f.label, unit: f.unit, qty, rate, amount, comp: comp[f.key] || null });
   }
   rows.sort((a,b) => a.label.localeCompare(b.label, undefined, { numeric:true, sensitivity:'base' }));
   LAST_ROWS = rows;
@@ -500,44 +443,21 @@ async function generateReport() {
   const totalAmount = rows.reduce((t,r) => t + ((r.amount != null && isFinite(r.amount)) ? r.amount : 0), 0);
   const catLabel = ({ ALL:'All items', RM:'Raw Material', FG:'Finished Goods', WIP:'WIP' })[cat] || cat;
 
-  // How many items got a non-zero quantity from whatever source
-  const gotAnyQty = Object.values(qtyInfo.byKey || {}).some(v => Math.abs(Number(v)||0) > 1e-9)
-                 || Object.values(qtyInfo.byLabel || {}).some(v => Math.abs(Number(v)||0) > 1e-9);
-
-  // Diagnostics (shown whenever the dated fetch didn't succeed) so the raw
-  // responses can be copied back to refine the exact endpoint/field.
-  const diagText = (qtyInfo.log && qtyInfo.log.length)
-    ? qtyInfo.log.map(e => `${e.ok ? 'OK ' : 'ERR'} ${e.step}\n   ${e.preview}`).join('\n\n')
-    : '(no diagnostic entries were captured — the API bridge may have rejected the requests silently)';
-  window.__DIAG = diagText;
-  const diagHtml = (!qtyInfo.dated)
-    ? `<div style="margin-top:12px;border:1px solid #d0d7de;border-radius:10px;padding:12px;background:#fbfcfd">
-         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-           <strong style="font-size:13px">Technical details — please copy &amp; send these</strong>
-           <button class="btn-secondary" style="padding:5px 12px;font-size:12px"
-                   onclick="navigator.clipboard.writeText(window.__DIAG).then(()=>this.textContent='Copied ✓').catch(()=>{const t=document.getElementById('diag-text');t.focus();t.select();})">Copy diagnostics</button>
-         </div>
-         <textarea id="diag-text" readonly style="width:100%;height:240px;margin-top:8px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid #d0d7de;border-radius:8px;padding:10px;white-space:pre;overflow:auto">${esc(diagText)}</textarea>
-       </div>`
-    : '';
-
+  const feedsLoaded = TX.start.length + TX.recv.length + TX.deliv.length + TX.je.length + TX.prod.length;
   let noteCls, noteTxt;
-  if (qtyInfo.dated) {
-    noteCls = 'ok-box';
-    noteTxt = `Quantities are closing balances as on ${fmtDate(dk)} (Manager ${qtyInfo.method || 'inventory-quantity report'}).`;
-  } else if (gotAnyQty) {
-    noteCls = 'warn-box';
-    noteTxt = `Could not retrieve a date-specific closing balance, so quantities shown are the current live quantity on hand — not the balance as on ${fmtDate(dk)}. Rate is still date-correct.`;
-  } else {
+  if (feedsLoaded === 0) {
     noteCls = 'err-box';
-    noteTxt = `Couldn't obtain quantities. Manager's item list doesn't expose quantity, and the dated inventory-quantity report returned no rows on this build. Rate is correct; quantity needs the report endpoint to work.`;
+    noteTxt = `No transaction data was loaded, so all quantities are zero. The transaction -batch endpoint names may differ on your build — reload and check the “Feeds” line, then tell me which came back empty.`;
+  } else {
+    noteCls = 'ok-box';
+    noteTxt = `Quantities computed from transactions as on ${fmtDate(dk)}: starting balance + goods receipts ${includeProd ? '+ production produced − production consumed ' : ''}− delivery notes ± journal entries.` + (includeProd ? '' : ' (Production excluded, matching your formula — tick “Include production” to add it.)');
   }
-  msg.innerHTML = `<div class="${noteCls}">${esc(noteTxt)}</div>${diagHtml}`;
+  msg.innerHTML = `<div class="${noteCls}">${esc(noteTxt)}</div>`;
 
   if (!rows.length) {
     out.innerHTML = `<div class="empty">No items to show for “${esc(catLabel)}”${search ? ' / “'+esc(search)+'”' : ''} on ${esc(fmtDate(dk))}${hideZero ? ' (zero-quantity rows are hidden).' : '.'}</div>`;
   } else {
-    out.innerHTML = renderTable(rows, totalAmount, catLabel, dk);
+    out.innerHTML = renderTable(rows, totalAmount, catLabel, dk, showBreak);
   }
 
   // Build print surface
@@ -546,17 +466,27 @@ async function generateReport() {
       <div class="doc-title">Stock in Hand — ${esc(catLabel)}</div>
       <div class="doc-meta">As on ${esc(fmtDate(dk))}</div>
     </div>
-    ${renderTable(rows, totalAmount, catLabel, dk)}` : '';
+    ${renderTable(rows, totalAmount, catLabel, dk, showBreak)}` : '';
   document.getElementById('print-btn').disabled = !rows.length;
 
   genBtn.disabled = false; genBtn.textContent = 'Generate report';
 }
 
-function renderTable(rows, totalAmount, catLabel, dk) {
+function renderTable(rows, totalAmount, catLabel, dk, showBreak) {
+  const bh = showBreak
+    ? `<th class="num">Opening</th><th class="num">Receipts</th><th class="num">Produced</th><th class="num">Consumed</th><th class="num">Delivered</th><th class="num">JE</th>`
+    : '';
+  const bc = r => {
+    if (!showBreak) return '';
+    const c = r.comp || { open:0,recv:0,prod:0,cons:0,deliv:0,je:0 };
+    return `<td class="num muted">${num(c.open)}</td><td class="num muted">${num(c.recv)}</td><td class="num muted">${num(c.prod)}</td><td class="num muted">${num(c.cons)}</td><td class="num muted">${num(c.deliv)}</td><td class="num muted">${num(c.je)}</td>`;
+  };
+  const spanCols = showBreak ? 10 : 4;
   const body = rows.map((r, i) => `
     <tr>
       <td>${i+1}</td>
       <td>${esc(r.label)}${r.unit ? ` <span class="muted">(${esc(r.unit)})</span>` : ''}</td>
+      ${bc(r)}
       <td class="num">${num(r.qty)}</td>
       <td class="num">${r.rate != null ? money(r.rate) : '<span class="muted">—</span>'}</td>
       <td class="num">${r.amount != null ? money(r.amount) : '<span class="muted">—</span>'}</td>
@@ -567,15 +497,16 @@ function renderTable(rows, totalAmount, catLabel, dk) {
         <tr>
           <th style="width:42px">#</th>
           <th>Inventory Item</th>
-          <th class="num" style="width:130px">Qty in Hand</th>
-          <th class="num" style="width:130px">Rate</th>
-          <th class="num" style="width:150px">Amount</th>
+          ${bh}
+          <th class="num" style="width:120px">Qty in Hand</th>
+          <th class="num" style="width:120px">Rate</th>
+          <th class="num" style="width:140px">Amount</th>
         </tr>
       </thead>
       <tbody>${body}</tbody>
       <tfoot>
         <tr>
-          <td colspan="4" class="num">Total Stock Value — ${esc(catLabel)} as on ${esc(fmtDate(dk))}</td>
+          <td colspan="${spanCols}" class="num">Total Stock Value — ${esc(catLabel)} as on ${esc(fmtDate(dk))}</td>
           <td class="num">${money(totalAmount)}</td>
         </tr>
       </tfoot>
